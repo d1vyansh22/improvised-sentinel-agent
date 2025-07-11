@@ -180,7 +180,6 @@ def query_enricher_tool(user_query: str) -> Dict[str, Any]:
             openai_llm = ChatOpenAI(
                 model="gpt-4o",
                 temperature=0.1,
-                max_tokens=4096,
                 timeout=30
             )
 
@@ -208,11 +207,14 @@ if __name__ == "__main__":
     for query in test_queries:
         print(f"\n=== Testing: {query} ===")
         result = query_enricher_tool(query)
-        print(f"Success: {result['success']}")
-        if result['success']:
-            enriched = result['enriched_data']
-            print(f"Tables: {enriched['selected_tables']}")
-            print(f"IoCs: {enriched['ioc_types']}")
-            print(f"Confidence: {enriched['confidence_score']}")
+        if isinstance(result, dict):
+            print(f"Success: {result.get('success')}")
+            if result.get('success'):
+                enriched = result.get('enriched_data', {})
+                print(f"Tables: {enriched.get('selected_tables')}")
+                print(f"IoCs: {enriched.get('ioc_types')}")
+                print(f"Confidence: {enriched.get('confidence_score')}")
+            else:
+                print(f"Error: {result.get('error', 'Unknown error')}")
         else:
-            print(f"Error: {result.get('error', 'Unknown error')}")
+            print(f"Result: {result}")

@@ -130,10 +130,10 @@ def build_schema_context(table_name: str) -> Dict[str, str]:
 
     return {
         "table_name": table_name,
-        "table_schema": schema,
+        "table_schema": str(schema),
         "field_list": ", ".join(field_list),
         "description": schema.get("description", ""),
-        "primary_iocs": schema.get("primary_iocs", []),
+        "primary_iocs": ", ".join(schema.get("primary_iocs", [])),
         "sample_query": schema.get("sample_query", "")
     }
 

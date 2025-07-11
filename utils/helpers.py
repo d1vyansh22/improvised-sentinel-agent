@@ -284,7 +284,7 @@ def format_processing_time(start_time: float) -> float:
     """Calculate processing time in milliseconds"""
     return (time.time() - start_time) * 1000
 
-def create_error_response(error_message: str, query_id: str = None) -> Dict[str, Any]:
+def create_error_response(error_message: str, query_id: str = "") -> Dict[str, Any]:
     """Create standardized error response"""
     return {
         "success": False,

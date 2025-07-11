@@ -85,6 +85,7 @@ class QueryValidatorTool:
     def _mock_kql_analyzer(self, query: str, table_name: str) -> Dict[str, Any]:
         """Mock KQL analyzer for demo purposes"""
         parsing_errors = []
+        available_fields = []  # Ensure always defined
 
         # Basic validation checks
         if not query:
@@ -342,7 +343,6 @@ def query_validator_tool(generated_queries: List[Dict[str, Any]]) -> Dict[str, A
             openai_llm = ChatOpenAI(
                 model="gpt-4o",
                 temperature=0.1,
-                max_tokens=4096,
                 timeout=30
             )
 
@@ -383,17 +383,37 @@ if __name__ == "__main__":
     ]
 
     print("=== Testing Query Validator ===")
-    result = query_validator_tool(test_queries)
-    print(f"Success: {result['success']}")
-    print(f"Success rate: {result['success_rate']:.2f}")
-
-    if result['success']:
-        for validated in result['validated_queries']:
-            print(f"\nTable: {validated['table']}")
-            print(f"Valid: {validated['is_valid']}")
-            print(f"Iterations: {validated['refinement_iterations']}")
-            print(f"Final confidence: {validated['confidence_final']:.2f}")
-            if validated['validation_errors']:
-                print(f"Errors: {validated['validation_errors']}")
+    # Use the QueryValidatorTool directly for testing
+    import os
+    from dotenv import load_dotenv
+    load_dotenv()
+    gemini_llm = ChatGoogleGenerativeAI(
+        model="gemini-2.0-flash",
+        temperature=0.1,
+        timeout=30
+    )
+    openai_llm = None
+    if os.getenv("OPENAI_API_KEY"):
+        openai_llm = ChatOpenAI(
+            model="gpt-4o",
+            temperature=0.1,
+            timeout=30
+        )
+    max_attempts = int(os.getenv("MAX_VALIDATION_ATTEMPTS", "3"))
+    validator = QueryValidatorTool(gemini_llm, openai_llm, max_attempts)
+    result = validator.validate_and_repair_queries(test_queries)
+    if isinstance(result, dict):
+        print(f"Success: {result.get('success')}")
+        print(f"Success rate: {result.get('success_rate', 0):.2f}")
+        if result.get('success'):
+            for validated in result.get('validated_queries', []):
+                print(f"\nTable: {validated.get('table')}")
+                print(f"Valid: {validated.get('is_valid')}")
+                print(f"Iterations: {validated.get('refinement_iterations')}")
+                print(f"Final confidence: {validated.get('confidence_final', 0):.2f}")
+                if validated.get('validation_errors'):
+                    print(f"Errors: {validated.get('validation_errors')}")
+        else:
+            print(f"Error: {result.get('error', 'Unknown error')}")
     else:
-        print(f"Error: {result.get('error', 'Unknown error')}")
+        print(f"Result: {result}")

@@ -52,7 +52,8 @@ def enrich_query_node(state: ThreatIntelligenceState) -> Dict[str, Any]:
         logger.info("Starting query enrichment", query_id=state["query_id"])
 
         # Call query enricher tool
-        result = query_enricher_tool(state["user_query"])
+        result = query_enricher_tool.invoke({"query": state["user_query"]})
+
 
         if result["success"]:
             return {
@@ -86,7 +87,7 @@ def generate_kql_node(state: ThreatIntelligenceState) -> Dict[str, Any]:
         logger.info("Starting KQL generation", query_id=state["query_id"])
 
         # Call KQL generator tool
-        result = kql_generator_tool(state["enriched_data"])
+        result = kql_generator_tool.invoke({"query": state["enriched_data"]})
 
         if result["success"]:
             return {
@@ -122,7 +123,7 @@ def validate_queries_node(state: ThreatIntelligenceState) -> Dict[str, Any]:
         logger.info("Starting query validation", query_id=state["query_id"])
 
         # Call query validator tool
-        result = query_validator_tool(state["generated_queries"])
+        result = query_validator_tool.invoke({"query": state["generated_queries"]})
 
         if result["success"]:
             return {

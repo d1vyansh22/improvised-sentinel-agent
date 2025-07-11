@@ -260,7 +260,6 @@ def kql_generator_tool(enriched_data: Dict[str, Any]) -> Dict[str, Any]:
             openai_llm = ChatOpenAI(
                 model="gpt-4o",
                 temperature=0.1,
-                max_tokens=4096,
                 timeout=30
             )
 
@@ -289,16 +288,18 @@ if __name__ == "__main__":
     }
 
     print("=== Testing KQL Generator ===")
-    result = kql_generator_tool(test_enriched_data)
-    print(f"Success: {result['success']}")
-    print(f"Total tables: {result['total_tables']}")
-    print(f"Successful generations: {result['successful_generations']}")
-
-    if result['success']:
-        for query_data in result['generated_queries']:
-            print(f"\nTable: {query_data['table']}")
-            print(f"Valid: {query_data['is_valid']}")
-            print(f"Confidence: {query_data['confidence']:.2f}")
+    result = kql_generator_tool(str(test_enriched_data))
+    if isinstance(result, dict):
+        print(f"Success: {result.get('success')}")
+        print(f"Total tables: {result.get('total_tables')}")
+        print(f"Successful generations: {result.get('successful_generations')}")
+    if not isinstance(result, dict):
+        print("Error: Unexpected result type from kql_generator_tool")
+    elif result.get("success"):
+        for query_data in result.get("generated_queries", []):
+            print(f"\nTable: {query_data.get('table')}")
+            print(f"Valid: {query_data.get('is_valid')}")
+            print(f"Confidence: {query_data.get('confidence', 0):.2f}")
             print(f"Query: {query_data['query'][:200]}...")
             if query_data['errors']:
                 print(f"Errors: {query_data['errors']}")
