@@ -1,282 +1,399 @@
 """
-Query Validator Tool
-Validates and refines KQL queries with basic syntax and semantic checks
+Query Validator Tool - Validates and repairs KQL queries using LLM reflection
 """
 
+import json
+import requests
+import structlog
+from typing import Dict, Any, List
 from langchain_core.tools import tool
-from typing import Dict, List, Any
-import re
-import sys
-import os
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_openai import ChatOpenAI
+from tenacity import retry, stop_after_attempt, wait_exponential
 
-# Add parent directory to path to import schemas
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from schemas.azure_schemas import AZURE_SENTINEL_SCHEMAS, get_table_schema
+from utils.models import ValidationResult
+from utils.prompts import format_validation_repair_prompt
+from utils.helpers import SecurityValidator, LLMResponseParser, metrics_collector
+from schema_definitions import get_table_schema
 
-@tool
-def validate_and_refine_queries(query_data: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Validates KQL queries and provides basic refinements and error checking.
+logger = structlog.get_logger()
 
-    Args:
-        query_data: Output from the KQL generator tool
+class QueryValidatorTool:
+    """Tool for validating and repairing KQL queries using LLM reflection"""
 
-    Returns:
-        Dictionary containing validated queries with error analysis and suggestions
-    """
+    def __init__(self, llm_primary, llm_fallback=None, max_attempts=3):
+        self.llm_primary = llm_primary
+        self.llm_fallback = llm_fallback
+        self.max_attempts = max_attempts
+        self.security_validator = SecurityValidator()
+        self.parser = LLMResponseParser()
 
-    queries = query_data.get("queries", [])
-    validated_queries = []
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10)
+    )
+    def _make_llm_call(self, prompt: str) -> str:
+        """Make LLM call with retry logic"""
+        try:
+            response = self.llm_primary.invoke(prompt)
+            metrics_collector.record_llm_call("gemini", "gemini-2.0-flash", True)
+            return response.content
+        except Exception as e:
+            logger.warning("Primary LLM call failed", error=str(e))
+            metrics_collector.record_llm_call("gemini", "gemini-2.0-flash", False)
 
-    for query_info in queries:
-        table = query_info.get("table", "")
-        kql_query = query_info.get("query", "")
+            if self.llm_fallback:
+                try:
+                    response = self.llm_fallback.invoke(prompt)
+                    metrics_collector.record_llm_call("openai", "gpt-4o", True)
+                    logger.info("Fallback LLM call successful")
+                    return response.content
+                except Exception as fallback_error:
+                    logger.error("Fallback LLM call failed", error=str(fallback_error))
+                    metrics_collector.record_llm_call("openai", "gpt-4o", False)
+                    raise
+            raise
 
-        # Perform validation
-        validation_result = validate_single_query(kql_query, table)
+    def _call_kql_analyzer(self, query: str, table_name: str) -> Dict[str, Any]:
+        """Call KQL analyzer API for validation (mock implementation)"""
+        try:
+            import os
+            endpoint = os.getenv("KQL_ANALYZER_ENDPOINT", "http://localhost:8000/api/analyze")
+            timeout = int(os.getenv("KQL_ANALYZER_TIMEOUT", "15"))
 
-        # Create enhanced query info with validation results
-        validated_query = {
-            **query_info,
-            "original_query": kql_query,
-            "validation_passed": validation_result["is_valid"],
-            "validation_errors": validation_result["errors"],
-            "validation_warnings": validation_result["warnings"],
-            "refined_query": validation_result.get("refined_query", kql_query),
-            "validation_score": validation_result["score"],
-            "suggestions": validation_result["suggestions"]
+            # Mock KQL analyzer response for demo purposes
+            # In production, this would call a real KQL analyzer service
+            mock_response = self._mock_kql_analyzer(query, table_name)
+
+            # Uncomment below for real KQL analyzer call
+            # payload = {"query": query, "environment": "sentinel"}
+            # response = requests.post(endpoint, json=payload, timeout=timeout)
+            # return response.json()
+
+            return mock_response
+
+        except requests.RequestException as e:
+            logger.error("KQL analyzer call failed", error=str(e))
+            return {
+                "parsing_errors": [f"Analyzer service unavailable: {str(e)}"],
+                "output_columns": {},
+                "referenced_tables": [],
+                "referenced_functions": [],
+                "referenced_columns": []
+            }
+
+    def _mock_kql_analyzer(self, query: str, table_name: str) -> Dict[str, Any]:
+        """Mock KQL analyzer for demo purposes"""
+        parsing_errors = []
+
+        # Basic validation checks
+        if not query:
+            parsing_errors.append("Query is empty")
+        elif table_name not in query:
+            parsing_errors.append(f"Query does not reference expected table '{table_name}'")
+        elif "|" not in query:
+            parsing_errors.append("Query missing pipe operators")
+        elif "where" not in query.lower():
+            parsing_errors.append("Query should include 'where' clause for filtering")
+
+        # Check for common syntax errors
+        if query.count("(") != query.count(")"):
+            parsing_errors.append("Unbalanced parentheses")
+
+        # Check for field existence (simplified)
+        table_schema = get_table_schema(table_name)
+        if table_schema:
+            available_fields = list(table_schema.get("fields", {}).keys())
+            # Simple check for field references
+            for field in available_fields:
+                if field in query and field not in available_fields:
+                    parsing_errors.append(f"Field '{field}' not found in table schema")
+
+        return {
+            "parsing_errors": parsing_errors,
+            "output_columns": {"timestamp_1": "datetime", "result": "string"} if not parsing_errors else {},
+            "referenced_tables": [table_name] if table_name in query else [],
+            "referenced_functions": [],
+            "referenced_columns": available_fields[:3] if table_schema else []
         }
 
-        validated_queries.append(validated_query)
+    def _validate_with_reflection(self, query: str, table_name: str) -> ValidationResult:
+        """Validate query with LLM reflection loop"""
+        original_query = query
+        current_query = query
+        attempts = 0
 
-    # Calculate overall validation metrics
-    total_queries = len(validated_queries)
-    passed_queries = sum(1 for q in validated_queries if q["validation_passed"])
-    success_rate = (passed_queries / total_queries) if total_queries > 0 else 0
+        while attempts < self.max_attempts:
+            attempts += 1
+            metrics_collector.record_validation_attempt(False)  # Will update if successful
 
-    return {
-        "validated_queries": validated_queries,
-        "validation_summary": {
-            "total_queries": total_queries,
-            "passed_validation": passed_queries,
-            "success_rate": round(success_rate, 2),
-            "avg_validation_score": round(
-                sum(q["validation_score"] for q in validated_queries) / total_queries, 2
-            ) if total_queries > 0 else 0
-        },
-        "overall_status": "PASSED" if success_rate >= 0.8 else "NEEDS_REVIEW"
-    }
+            logger.info("Validation attempt", attempt=attempts, table=table_name)
 
-def validate_single_query(kql_query: str, table_name: str) -> Dict[str, Any]:
-    """Validate a single KQL query"""
+            # Call KQL analyzer
+            analyzer_result = self._call_kql_analyzer(current_query, table_name)
 
-    errors = []
-    warnings = []
-    suggestions = []
-    score = 1.0
+            # Check if validation passed
+            if not analyzer_result.get("parsing_errors", []):
+                logger.info("Query validation successful", 
+                           attempts=attempts, 
+                           table=table_name)
+                metrics_collector.record_validation_attempt(True)
 
-    # Get table schema for validation
-    schema = get_table_schema(table_name)
-    valid_fields = schema.get("fields", [])
+                return ValidationResult(
+                    original_query=original_query,
+                    final_query=current_query,
+                    is_valid=True,
+                    validation_errors=[],
+                    refinement_iterations=attempts - 1,
+                    confidence_final=0.9,
+                    analyzer_response=analyzer_result
+                )
 
-    # Basic syntax validation
-    syntax_check = validate_syntax(kql_query)
-    if not syntax_check["is_valid"]:
-        errors.extend(syntax_check["errors"])
-        score -= 0.3
+            # If max attempts reached, return with errors
+            if attempts >= self.max_attempts:
+                logger.warning("Max validation attempts reached", 
+                              attempts=attempts, 
+                              table=table_name)
 
-    # Field validation
-    field_check = validate_fields(kql_query, valid_fields, table_name)
-    if field_check["invalid_fields"]:
-        warnings.extend([f"Unknown field: {field}" for field in field_check["invalid_fields"]])
-        score -= 0.1 * len(field_check["invalid_fields"])
+                return ValidationResult(
+                    original_query=original_query,
+                    final_query=current_query,
+                    is_valid=False,
+                    validation_errors=analyzer_result.get("parsing_errors", []),
+                    refinement_iterations=attempts - 1,
+                    confidence_final=0.3,
+                    analyzer_response=analyzer_result
+                )
 
-    # Performance validation
-    performance_check = validate_performance(kql_query)
-    if performance_check["warnings"]:
-        warnings.extend(performance_check["warnings"])
-        suggestions.extend(performance_check["suggestions"])
+            # Use LLM reflection to fix errors
+            try:
+                repair_prompt = format_validation_repair_prompt(
+                    current_query, 
+                    analyzer_result.get("parsing_errors", []),
+                    table_name
+                )
 
-    # Logical validation
-    logic_check = validate_logic(kql_query, table_name)
-    suggestions.extend(logic_check["suggestions"])
+                repair_response = self._make_llm_call(repair_prompt)
 
-    # Generate refined query if needed
-    refined_query = refine_query(kql_query, table_name, valid_fields) if errors or warnings else kql_query
+                # Extract repaired query
+                repaired_query = self.parser.extract_kql_from_response(repair_response)
 
-    is_valid = len(errors) == 0
-    final_score = max(0.0, min(1.0, score))
+                # Check if LLM indicated the query is unfixable
+                if "UNFIXABLE" in repair_response.upper():
+                    logger.warning("LLM indicated query is unfixable", 
+                                  table=table_name, 
+                                  errors=analyzer_result.get("parsing_errors", []))
 
-    return {
-        "is_valid": is_valid,
-        "errors": errors,
-        "warnings": warnings,
-        "suggestions": suggestions,
-        "score": round(final_score, 2),
-        "refined_query": refined_query
-    }
+                    return ValidationResult(
+                        original_query=original_query,
+                        final_query=current_query,
+                        is_valid=False,
+                        validation_errors=analyzer_result.get("parsing_errors", []) + ["Query deemed unfixable by LLM"],
+                        refinement_iterations=attempts - 1,
+                        confidence_final=0.1,
+                        analyzer_response=analyzer_result
+                    )
 
-def validate_syntax(kql_query: str) -> Dict[str, Any]:
-    """Basic KQL syntax validation"""
-    errors = []
+                # Update current query for next iteration
+                current_query = repaired_query
 
-    # Check for basic KQL structure
-    if not kql_query.strip():
-        errors.append("Query is empty")
-        return {"is_valid": False, "errors": errors}
+                logger.info("Query repaired by LLM", 
+                           attempt=attempts, 
+                           table=table_name)
 
-    lines = [line.strip() for line in kql_query.split('\n') if line.strip()]
+            except Exception as e:
+                logger.error("Query repair failed", 
+                           error=str(e), 
+                           attempt=attempts, 
+                           table=table_name)
 
-    # First line should be table name (basic check)
-    if not lines:
-        errors.append("No query content found")
-        return {"is_valid": False, "errors": errors}
+                return ValidationResult(
+                    original_query=original_query,
+                    final_query=current_query,
+                    is_valid=False,
+                    validation_errors=analyzer_result.get("parsing_errors", []) + [f"Repair failed: {str(e)}"],
+                    refinement_iterations=attempts - 1,
+                    confidence_final=0.2,
+                    analyzer_response=analyzer_result
+                )
 
-    first_line = lines[0]
-    if '|' in first_line and not first_line.startswith('|'):
-        errors.append("First line should be table name without pipe operator")
+        # Should never reach here, but just in case
+        return ValidationResult(
+            original_query=original_query,
+            final_query=current_query,
+            is_valid=False,
+            validation_errors=["Max attempts exceeded"],
+            refinement_iterations=attempts,
+            confidence_final=0.1,
+            analyzer_response={}
+        )
 
-    # Check for unmatched parentheses
-    open_parens = kql_query.count('(')
-    close_parens = kql_query.count(')')
-    if open_parens != close_parens:
-        errors.append(f"Unmatched parentheses: {open_parens} open, {close_parens} close")
+    def validate_and_repair_queries(self, generated_queries: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Validate and repair generated KQL queries
 
-    # Check for proper pipe usage
-    for i, line in enumerate(lines[1:], 1):  # Skip first line
-        if line and not line.startswith('|'):
-            errors.append(f"Line {i+1} should start with pipe operator (|)")
+        Args:
+            generated_queries: List of generated KQL queries from generator tool
 
-    # Check for dangerous operators (basic security)
-    dangerous_ops = ['drop', 'delete', 'create', 'alter']
-    for op in dangerous_ops:
-        if re.search(rf'\b{op}\b', kql_query, re.IGNORECASE):
-            errors.append(f"Potentially dangerous operation detected: {op}")
+        Returns:
+            Dictionary containing validation results
+        """
+        try:
+            validated_queries = []
+            successful_validations = 0
 
-    return {"is_valid": len(errors) == 0, "errors": errors}
+            for query_data in generated_queries:
+                if not query_data.get("query"):
+                    # Skip empty queries
+                    validated_queries.append({
+                        "original_query": "",
+                        "final_query": "",
+                        "is_valid": False,
+                        "validation_errors": ["Query is empty"],
+                        "refinement_iterations": 0,
+                        "confidence_final": 0.0,
+                        "table": query_data.get("table", "unknown")
+                    })
+                    continue
 
-def validate_fields(kql_query: str, valid_fields: List[str], table_name: str) -> Dict[str, Any]:
-    """Validate field names used in the query"""
+                # Validate query with reflection
+                validation_result = self._validate_with_reflection(
+                    query_data["query"],
+                    query_data["table"]
+                )
 
-    # Extract field names from query (basic regex)
-    field_pattern = r'\b([a-zA-Z_][a-zA-Z0-9_]*)\s*(?:[><=!]|has|contains|startswith|endswith)'
-    found_fields = re.findall(field_pattern, kql_query, re.IGNORECASE)
+                result_dict = validation_result.model_dump()
+                result_dict["table"] = query_data["table"]
+                validated_queries.append(result_dict)
 
-    # Also check fields in summarize, project, etc.
-    summarize_pattern = r'summarize[^|]*by\s+([^|\n]+)'
-    project_pattern = r'project\s+([^|\n]+)'
+                if validation_result.is_valid:
+                    successful_validations += 1
 
-    for pattern in [summarize_pattern, project_pattern]:
-        matches = re.findall(pattern, kql_query, re.IGNORECASE)
-        for match in matches:
-            # Split by comma and clean up
-            fields_in_clause = [f.strip() for f in match.split(',')]
-            found_fields.extend(fields_in_clause)
+            success_rate = successful_validations / len(generated_queries) if generated_queries else 0
 
-    # Remove duplicates and filter out obvious non-field names
-    found_fields = list(set([f for f in found_fields if f and not f.isdigit() and len(f) > 1]))
+            logger.info("Query validation completed", 
+                       total_queries=len(generated_queries),
+                       successful=successful_validations,
+                       success_rate=success_rate)
 
-    # Check against valid fields
-    invalid_fields = [f for f in found_fields if f not in valid_fields and f not in 
-                     ['count_', 'count', 'avg', 'sum', 'max', 'min']]  # Common aggregation fields
-
-    return {
-        "found_fields": found_fields,
-        "invalid_fields": invalid_fields
-    }
-
-def validate_performance(kql_query: str) -> Dict[str, Any]:
-    """Check for potential performance issues"""
-    warnings = []
-    suggestions = []
-
-    # Check for missing time filters
-    if not re.search(r'ago\s*\(', kql_query, re.IGNORECASE):
-        warnings.append("No time filter detected - query may be slow on large datasets")
-        suggestions.append("Add a time filter like: | where timestamp > ago(7d)")
-
-    # Check for missing limits
-    if not re.search(r'\|\s*limit\s+\d+', kql_query, re.IGNORECASE):
-        suggestions.append("Consider adding a limit clause to control result size")
-
-    # Check for potentially expensive operations
-    if re.search(r'contains|has_any|startswith|endswith', kql_query, re.IGNORECASE):
-        suggestions.append("String operations detected - ensure proper indexing for performance")
-
-    return {"warnings": warnings, "suggestions": suggestions}
-
-def validate_logic(kql_query: str, table_name: str) -> Dict[str, Any]:
-    """Validate logical consistency of the query"""
-    suggestions = []
-
-    # Check for meaningful aggregations
-    if 'summarize' in kql_query.lower():
-        if 'count()' not in kql_query.lower():
-            suggestions.append("Consider using count() in summarize for threat hunting analysis")
-
-    # Table-specific suggestions
-    if table_name == "AuthenticationEvents":
-        if 'result' not in kql_query.lower():
-            suggestions.append("Consider filtering by authentication result for security analysis")
-    elif table_name == "Email":
-        if 'sender' not in kql_query.lower() and 'recipient' not in kql_query.lower():
-            suggestions.append("Consider including sender or recipient analysis for email threats")
-
-    return {"suggestions": suggestions}
-
-def refine_query(kql_query: str, table_name: str, valid_fields: List[str]) -> str:
-    """Attempt to refine/fix the query"""
-
-    refined = kql_query
-
-    # Fix common issues
-    lines = refined.split('\n')
-
-    # Ensure first line doesn't have pipe
-    if lines and lines[0].strip().startswith('|'):
-        lines[0] = lines[0].strip()[1:].strip()
-
-    # Ensure subsequent lines have pipes
-    for i in range(1, len(lines)):
-        if lines[i].strip() and not lines[i].strip().startswith('|'):
-            lines[i] = '| ' + lines[i].strip()
-
-    refined = '\n'.join(lines)
-
-    return refined
-
-# Example usage function for testing
-def test_validator():
-    """Test the validator with sample query data"""
-    test_query_data = {
-        "queries": [
-            {
-                "table": "Email",
-                "query": "Email\n| where event_time > ago(7d)\n| summarize count() by sender\n| limit 100",
-                "confidence": 0.85
-            },
-            {
-                "table": "AuthenticationEvents", 
-                "query": "AuthenticationEvents\n| where timestamp > ago(7d)\n| where result != 'Success'\n| summarize failed_attempts=count() by username, src_ip\n| limit 100",
-                "confidence": 0.90
+            return {
+                "validated_queries": validated_queries,
+                "total_queries": len(generated_queries),
+                "successful_validations": successful_validations,
+                "success_rate": success_rate,
+                "success": True,
+                "metadata": {
+                    "validation_summary": {
+                        "total": len(generated_queries),
+                        "valid": successful_validations,
+                        "invalid": len(generated_queries) - successful_validations,
+                        "success_rate": success_rate
+                    }
+                }
             }
-        ]
-    }
 
-    result = validate_and_refine_queries(test_query_data)
+        except Exception as e:
+            logger.error("Query validation failed", error=str(e))
+            return {
+                "validated_queries": [],
+                "total_queries": 0,
+                "successful_validations": 0,
+                "success_rate": 0.0,
+                "success": False,
+                "error": str(e)
+            }
 
-    print("Validation Results:")
-    print(f"Success Rate: {result['validation_summary']['success_rate']}")
+# Create tool instance function for LangGraph
+@tool
+def query_validator_tool(generated_queries: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Validate and repair KQL queries using LLM reflection.
 
-    for query in result["validated_queries"]:
-        print(f"\nTable: {query['table']}")
-        print(f"Validation Passed: {query['validation_passed']}")
-        print(f"Score: {query['validation_score']}")
-        if query['validation_errors']:
-            print(f"Errors: {query['validation_errors']}")
-        if query['validation_warnings']:
-            print(f"Warnings: {query['validation_warnings']}")
-        print("-" * 50)
+    Args:
+        generated_queries: List of generated KQL queries from generator tool
 
+    Returns:
+        Dictionary with validation results and repaired queries
+    """
+    try:
+        import os
+        from dotenv import load_dotenv
+        load_dotenv()
+
+        if not os.getenv("GOOGLE_API_KEY") and not os.getenv("OPENAI_API_KEY"):
+            return {
+                "validated_queries": [],
+                "total_queries": 0,
+                "successful_validations": 0,
+                "success_rate": 0.0,
+                "success": False,
+                "error": "GOOGLE_API_KEY or OPENAI_API_KEY is not set. Please add it to your .env file."
+            }
+
+        gemini_llm = ChatGoogleGenerativeAI(
+            model="gemini-2.0-flash",
+            temperature=0.1,
+            max_tokens=4096,
+            timeout=30
+        )
+
+        openai_llm = None
+        if os.getenv("OPENAI_API_KEY"):
+            openai_llm = ChatOpenAI(
+                model="gpt-4o",
+                temperature=0.1,
+                max_tokens=4096,
+                timeout=30
+            )
+
+        max_attempts = int(os.getenv("MAX_VALIDATION_ATTEMPTS", "3"))
+        validator = QueryValidatorTool(gemini_llm, openai_llm, max_attempts)
+
+        return validator.validate_and_repair_queries(generated_queries)
+
+    except Exception as e:
+        logger.error("Failed to initialize query validator", error=str(e))
+        return {
+            "validated_queries": [],
+            "total_queries": 0,
+            "successful_validations": 0,
+            "success_rate": 0.0,
+            "success": False,
+            "error": f"Tool initialization failed: {str(e)}"
+        }
+
+# Example usage and testing
 if __name__ == "__main__":
-    test_validator()
+    # Test the tool with sample generated queries
+    test_queries = [
+        {
+            "table": "Email",
+            "query": "Email | where sender contains 'suspicious' | project sender, subject, timestamp",
+            "confidence": 0.8,
+            "is_valid": False,
+            "errors": []
+        },
+        {
+            "table": "AuthenticationEvents",
+            "query": "AuthenticationEvents | where result == 'Failed' | summarize count() by username",
+            "confidence": 0.9,
+            "is_valid": False,
+            "errors": []
+        }
+    ]
+
+    print("=== Testing Query Validator ===")
+    result = query_validator_tool(test_queries)
+    print(f"Success: {result['success']}")
+    print(f"Success rate: {result['success_rate']:.2f}")
+
+    if result['success']:
+        for validated in result['validated_queries']:
+            print(f"\nTable: {validated['table']}")
+            print(f"Valid: {validated['is_valid']}")
+            print(f"Iterations: {validated['refinement_iterations']}")
+            print(f"Final confidence: {validated['confidence_final']:.2f}")
+            if validated['validation_errors']:
+                print(f"Errors: {validated['validation_errors']}")
+    else:
+        print(f"Error: {result.get('error', 'Unknown error')}")

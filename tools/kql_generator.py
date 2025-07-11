@@ -1,174 +1,306 @@
 """
-KQL Generator Tool
-Generates KQL queries from enriched threat hunting requests
+KQL Generator Tool - Converts enriched queries into KQL queries for Azure Sentinel
 """
 
+import json
+import structlog
+from typing import Dict, Any, List
 from langchain_core.tools import tool
-from typing import Dict, List, Any
-import sys
-import os
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_openai import ChatOpenAI
+from tenacity import retry, stop_after_attempt, wait_exponential
 
-# Add parent directory to path to import schemas
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from schemas.azure_schemas import AZURE_SENTINEL_SCHEMAS, get_table_schema
+from utils.models import KQLQueryResult
+from utils.prompts import format_kql_generation_prompt
+from utils.helpers import SecurityValidator, LLMResponseParser, metrics_collector
+from schema_definitions import get_table_schema
 
+logger = structlog.get_logger()
+
+class KQLGeneratorTool:
+    """Tool for generating KQL queries from enriched threat intelligence requests"""
+
+    def __init__(self, llm_primary, llm_fallback=None):
+        self.llm_primary = llm_primary
+        self.llm_fallback = llm_fallback
+        self.security_validator = SecurityValidator()
+        self.parser = LLMResponseParser()
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10)
+    )
+    def _make_llm_call(self, prompt: str) -> str:
+        """Make LLM call with retry logic"""
+        try:
+            response = self.llm_primary.invoke(prompt)
+            metrics_collector.record_llm_call("gemini", "gemini-2.0-flash", True)
+            return response.content
+        except Exception as e:
+            logger.warning("Primary LLM call failed", error=str(e))
+            metrics_collector.record_llm_call("gemini", "gemini-2.0-flash", False)
+
+            if self.llm_fallback:
+                try:
+                    response = self.llm_fallback.invoke(prompt)
+                    metrics_collector.record_llm_call("openai", "gpt-4o", True)
+                    logger.info("Fallback LLM call successful")
+                    return response.content
+                except Exception as fallback_error:
+                    logger.error("Fallback LLM call failed", error=str(fallback_error))
+                    metrics_collector.record_llm_call("openai", "gpt-4o", False)
+                    raise
+            raise
+
+    def _calculate_query_confidence(self, query: str, table_name: str) -> float:
+        """Calculate confidence score for generated query"""
+        if not query or not table_name:
+            return 0.0
+
+        confidence = 0.5  # Base confidence
+
+        # Check for proper table reference
+        if table_name in query:
+            confidence += 0.2
+
+        # Check for time filtering
+        time_keywords = ["ago(", "timestamp", "datetime", "TimeGenerated"]
+        if any(keyword in query for keyword in time_keywords):
+            confidence += 0.2
+
+        # Check for proper KQL structure
+        kql_keywords = ["where", "project", "summarize", "limit", "sort", "take"]
+        keyword_count = sum(1 for keyword in kql_keywords if keyword in query.lower())
+        confidence += min(keyword_count * 0.05, 0.2)
+
+        # Check for proper operators
+        operators = ["==", "!=", "contains", "has", "in~", "startswith", "endswith"]
+        if any(op in query for op in operators):
+            confidence += 0.1
+
+        return min(confidence, 1.0)
+
+    def _validate_query_syntax(self, query: str, table_name: str) -> tuple[bool, List[str]]:
+        """Basic syntax validation for KQL query"""
+        errors = []
+
+        if not query:
+            errors.append("Query is empty")
+            return False, errors
+
+        # Check for table reference
+        if table_name not in query:
+            errors.append(f"Query does not reference table '{table_name}'")
+
+        # Check for basic KQL structure
+        if "|" not in query:
+            errors.append("Query appears to be missing KQL pipe operators")
+
+        # Check for balanced parentheses
+        if query.count("(") != query.count(")"):
+            errors.append("Unbalanced parentheses in query")
+
+        # Check for dangerous operations
+        is_safe, safety_warnings = self.security_validator.validate_kql_safety(query)
+        if not is_safe:
+            errors.extend(safety_warnings)
+
+        return len(errors) == 0, errors
+
+    def generate_kql_for_table(self, table_name: str, enriched_query: str, 
+                               ioc_types: List[str], time_range: str) -> KQLQueryResult:
+        """Generate KQL query for a specific table"""
+        try:
+            # Get table schema
+            table_schema = get_table_schema(table_name)
+            if not table_schema:
+                raise ValueError(f"Schema not found for table: {table_name}")
+
+            # Build KQL generation prompt
+            prompt = format_kql_generation_prompt(table_name, enriched_query, ioc_types, time_range)
+
+            logger.info("Generating KQL query", table=table_name, iocs=ioc_types)
+
+            # Make LLM call
+            response = self._make_llm_call(prompt)
+
+            # Extract KQL from response
+            kql_query = self.parser.extract_kql_from_response(response)
+
+            # Validate query
+            is_valid, errors = self._validate_query_syntax(kql_query, table_name)
+
+            # Calculate confidence
+            confidence = self._calculate_query_confidence(kql_query, table_name)
+
+            result = KQLQueryResult(
+                table=table_name,
+                query=kql_query,
+                confidence=confidence,
+                is_valid=is_valid,
+                errors=errors,
+                metadata={
+                    "ioc_types": ioc_types,
+                    "time_range": time_range,
+                    "schema_fields": list(table_schema.get("fields", {}).keys())
+                }
+            )
+
+            logger.info("KQL query generated", 
+                       table=table_name, 
+                       valid=is_valid, 
+                       confidence=confidence,
+                       errors=len(errors))
+
+            return result
+
+        except Exception as e:
+            logger.error("KQL generation failed", table=table_name, error=str(e))
+            return KQLQueryResult(
+                table=table_name,
+                query="",
+                confidence=0.0,
+                is_valid=False,
+                errors=[str(e)],
+                metadata={}
+            )
+
+    def generate_kql_queries(self, enriched_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Generate KQL queries from enriched threat intelligence data
+
+        Args:
+            enriched_data: Output from query enricher tool
+
+        Returns:
+            Dictionary containing generated KQL queries
+        """
+        try:
+            # Extract enrichment data
+            selected_tables = enriched_data.get("selected_tables", [])
+            enriched_query = enriched_data.get("enriched_query", "")
+            ioc_types = enriched_data.get("ioc_types", [])
+            time_range = enriched_data.get("time_range", "last 24 hours")
+
+            if not selected_tables:
+                raise ValueError("No tables selected for KQL generation")
+
+            # Generate queries for each table
+            generated_queries = []
+            successful_generations = 0
+
+            for table_name in selected_tables:
+                result = self.generate_kql_for_table(table_name, enriched_query, ioc_types, time_range)
+                generated_queries.append(result.model_dump())
+
+                if result.is_valid:
+                    successful_generations += 1
+
+            logger.info("KQL generation completed", 
+                       total_tables=len(selected_tables),
+                       successful=successful_generations)
+
+            return {
+                "generated_queries": generated_queries,
+                "total_tables": len(selected_tables),
+                "successful_generations": successful_generations,
+                "success": True,
+                "metadata": {
+                    "enriched_query": enriched_query,
+                    "ioc_types": ioc_types,
+                    "time_range": time_range
+                }
+            }
+
+        except Exception as e:
+            logger.error("KQL generation failed", error=str(e))
+            return {
+                "generated_queries": [],
+                "total_tables": 0,
+                "successful_generations": 0,
+                "success": False,
+                "error": str(e)
+            }
+
+# Create tool instance function for LangGraph
 @tool
-def generate_kql_queries(enriched_data: Dict[str, Any]) -> Dict[str, Any]:
+def kql_generator_tool(enriched_data: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Generates KQL queries from enriched threat hunting data.
+    Generate KQL queries from enriched threat intelligence data.
 
     Args:
-        enriched_data: Output from the query enricher tool
+        enriched_data: Dictionary containing enriched query data from query enricher
 
     Returns:
-        Dictionary containing generated KQL queries for each selected table
+        Dictionary with generated KQL queries for each selected table
     """
+    try:
+        import os
+        from dotenv import load_dotenv
+        load_dotenv()
 
-    selected_tables = enriched_data.get("selected_tables", [])
-    ioc_types = enriched_data.get("ioc_types", [])
-    time_range = enriched_data.get("time_range", "7d")
-    original_query = enriched_data.get("original_query", "")
+        if not os.getenv("GOOGLE_API_KEY") and not os.getenv("OPENAI_API_KEY"):
+            return {
+                "generated_queries": [],
+                "total_tables": 0,
+                "successful_generations": 0,
+                "success": False,
+                "error": "GOOGLE_API_KEY or OPENAI_API_KEY is not set. Please add it to your .env file."
+            }
 
-    queries = []
+        gemini_llm = ChatGoogleGenerativeAI(
+            model="gemini-2.0-flash",
+            temperature=0.1,
+            max_tokens=4096,
+            timeout=30
+        )
 
-    for table in selected_tables:
-        schema = get_table_schema(table)
-        if not schema:
-            continue
+        openai_llm = None
+        if os.getenv("OPENAI_API_KEY"):
+            openai_llm = ChatOpenAI(
+                model="gpt-4o",
+                temperature=0.1,
+                max_tokens=4096,
+                timeout=30
+            )
 
-        # Generate basic KQL query structure
-        kql_query = generate_table_query(table, schema, ioc_types, time_range, original_query)
+        generator = KQLGeneratorTool(gemini_llm, openai_llm)
+        return generator.generate_kql_queries(enriched_data)
 
-        queries.append({
-            "table": table,
-            "query": kql_query,
-            "confidence": calculate_query_confidence(table, ioc_types, original_query),
-            "description": schema.get("description", ""),
-            "expected_fields": schema.get("fields", [])
-        })
-
-    return {
-        "queries": queries,
-        "total_tables": len(selected_tables),
-        "generation_metadata": {
-            "time_range": time_range,
-            "ioc_focus": ioc_types,
-            "query_approach": "Multi-table threat hunting analysis"
+    except Exception as e:
+        logger.error("Failed to initialize KQL generator", error=str(e))
+        return {
+            "generated_queries": [],
+            "total_tables": 0,
+            "successful_generations": 0,
+            "success": False,
+            "error": f"Tool initialization failed: {str(e)}"
         }
-    }
 
-def generate_table_query(table_name: str, schema: Dict, ioc_types: List[str], 
-                        time_range: str, original_query: str) -> str:
-    """Generate KQL query for a specific table"""
-
-    fields = schema.get("fields", [])
-    table_iocs = schema.get("ioc_types", [])
-
-    # Base query structure
-    query_parts = [f"{table_name}"]
-
-    # Add time filter if timestamp field exists
-    if "timestamp" in fields:
-        query_parts.append(f"| where timestamp > ago({time_range})")
-    elif "timestamp_1" in fields:
-        query_parts.append(f"| where timestamp_1 > ago({time_range})")
-    elif "TimeGenerated" in fields:
-        query_parts.append(f"| where TimeGenerated > ago({time_range})")
-
-    # Add specific filters based on query context and IOC types
-    filters = generate_contextual_filters(table_name, ioc_types, original_query, fields)
-    query_parts.extend(filters)
-
-    # Add aggregation and limiting
-    if "email" in original_query.lower() and table_name == "Email":
-        query_parts.append("| summarize count() by sender, recipient")
-        query_parts.append("| where count_ > 1")
-    elif "login" in original_query.lower() and table_name == "AuthenticationEvents":
-        query_parts.append("| summarize failed_attempts=countif(result != 'Success') by username, src_ip")
-        query_parts.append("| where failed_attempts > 3")
-    elif "process" in original_query.lower() and table_name == "ProcessEvents":
-        query_parts.append("| summarize count() by process_name, hostname")
-    else:
-        # Default aggregation
-        if len(fields) > 2:
-            key_field = fields[0] if fields[0] != "timestamp" else fields[1]
-            query_parts.append(f"| summarize count() by {key_field}")
-
-    query_parts.append("| limit 100")
-
-    return "\n".join(query_parts)
-
-def generate_contextual_filters(table_name: str, ioc_types: List[str], 
-                               original_query: str, fields: List[str]) -> List[str]:
-    """Generate contextual filters based on query content"""
-    filters = []
-    query_lower = original_query.lower()
-
-    # Suspicious activity patterns
-    if "suspicious" in query_lower or "malicious" in query_lower:
-        if table_name == "ProcessEvents" and "process_name" in fields:
-            filters.append("| where process_name has_any('powershell', 'cmd', 'wscript', 'cscript')")
-        elif table_name == "InboundBrowsing" or table_name == "OutBoundBrowsing":
-            if "user_agent" in fields:
-                filters.append("| where user_agent contains 'python' or user_agent contains 'curl'")
-
-    # Failed/error patterns  
-    if "failed" in query_lower or "error" in query_lower:
-        if table_name == "AuthenticationEvents" and "result" in fields:
-            filters.append("| where result != 'Success'")
-
-    # External/unknown patterns
-    if "external" in query_lower or "unknown" in query_lower:
-        if "src_ip" in fields:
-            filters.append("| where not(ipv4_is_private(src_ip))")
-        elif "Source_IP" in fields:
-            filters.append("| where not(ipv4_is_private(Source_IP))")
-
-    # High volume patterns
-    if "multiple" in query_lower or "many" in query_lower:
-        # Will be handled in aggregation phase
-        pass
-
-    return filters
-
-def calculate_query_confidence(table_name: str, ioc_types: List[str], original_query: str) -> float:
-    """Calculate confidence score for generated query"""
-    base_confidence = 0.7
-
-    # Get table's IOC types
-    schema = get_table_schema(table_name)
-    table_iocs = schema.get("ioc_types", [])
-
-    # Boost confidence if IOC types match
-    ioc_match_score = len(set(ioc_types) & set(table_iocs)) / max(len(ioc_types), 1)
-
-    # Boost confidence for direct keyword matches
-    keyword_boost = 0.0
-    query_lower = original_query.lower()
-    if table_name.lower() in query_lower:
-        keyword_boost = 0.1
-
-    confidence = min(base_confidence + (ioc_match_score * 0.2) + keyword_boost, 0.95)
-    return round(confidence, 2)
-
-# Example usage function for testing
-def test_kql_generator():
-    """Test the KQL generator with sample enriched data"""
-    test_enriched = {
-        "original_query": "Find suspicious email activities from external domains",
-        "selected_tables": ["Email", "PassiveDNS"],
-        "ioc_types": ["email", "domain"],
-        "time_range": "7d"
-    }
-
-    result = generate_kql_queries(test_enriched)
-
-    print("Generated KQL Queries:")
-    for query_info in result["queries"]:
-        print(f"\nTable: {query_info['table']}")
-        print(f"Confidence: {query_info['confidence']}")
-        print(f"Query:\n{query_info['query']}")
-        print("-" * 50)
-
+# Example usage and testing
 if __name__ == "__main__":
-    test_kql_generator()
+    # Test the tool with sample enriched data
+    test_enriched_data = {
+        "enriched_query": "Find suspicious email activities from external domains",
+        "selected_tables": ["Email", "PassiveDNS"],
+        "ioc_types": ["email_address", "domain"],
+        "time_range": "last 24 hours",
+        "confidence_score": 0.85
+    }
+
+    print("=== Testing KQL Generator ===")
+    result = kql_generator_tool(test_enriched_data)
+    print(f"Success: {result['success']}")
+    print(f"Total tables: {result['total_tables']}")
+    print(f"Successful generations: {result['successful_generations']}")
+
+    if result['success']:
+        for query_data in result['generated_queries']:
+            print(f"\nTable: {query_data['table']}")
+            print(f"Valid: {query_data['is_valid']}")
+            print(f"Confidence: {query_data['confidence']:.2f}")
+            print(f"Query: {query_data['query'][:200]}...")
+            if query_data['errors']:
+                print(f"Errors: {query_data['errors']}")
+    else:
+        print(f"Error: {result.get('error', 'Unknown error')}")

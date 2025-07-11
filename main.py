@@ -1,290 +1,387 @@
 """
-Simple Threat Intelligence System
-Main LangGraph application using out-of-box functionality
+Main Threat Intelligence System - LangGraph Implementation
+This file contains the complete LangGraph workflow for threat intelligence analysis.
 """
 
 import os
-from typing import TypedDict, List, Dict, Any
+import time
+import json
+import structlog
+from typing import Dict, Any, List, TypedDict
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 
-from langchain_core.messages import HumanMessage, AIMessage
-from langgraph.graph import StateGraph, START, END
-from langgraph.graph.message import add_messages
-from typing_extensions import Annotated
+from langgraph.graph import StateGraph, END
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_openai import ChatOpenAI
 
-# Import our custom tools
-from tools.query_enricher import enrich_user_query
-from tools.kql_generator import generate_kql_queries  
-from tools.query_validator import validate_and_refine_queries
+from tools.query_enricher import query_enricher_tool
+from tools.kql_generator import kql_generator_tool
+from tools.query_validator import query_validator_tool
+from utils.models import ThreatIntelligenceResponse
+from utils.helpers import (
+    SecurityValidator, metrics_collector, generate_query_id, 
+    format_processing_time, create_error_response
+)
 
 # Load environment variables
 load_dotenv()
 
-class ThreatIntelState(TypedDict):
-    """State for the threat intelligence workflow"""
-    messages: Annotated[List[HumanMessage | AIMessage], add_messages]
+# Configure logging
+logger = structlog.get_logger()
+
+class ThreatIntelligenceState(TypedDict):
+    """State definition for the threat intelligence workflow"""
     user_query: str
     enriched_data: Dict[str, Any]
-    generated_queries: Dict[str, Any]
-    validated_queries: Dict[str, Any]
-    final_analysis: Dict[str, Any]
-    current_step: str
+    generated_queries: List[Dict[str, Any]]
+    validated_queries: List[Dict[str, Any]]
+    final_output: Dict[str, Any]
+    errors: List[str]
+    attempts: int
+    query_id: str
+    start_time: float
+    metadata: Dict[str, Any]
 
-class SimpleThreatIntelAgent:
-    """Simple threat intelligence agent using LangGraph"""
+# LangGraph Node Functions
+def enrich_query_node(state: ThreatIntelligenceState) -> Dict[str, Any]:
+    """
+    Node 1: Enrich natural language query using LLM
+    """
+    try:
+        logger.info("Starting query enrichment", query_id=state["query_id"])
+
+        # Call query enricher tool
+        result = query_enricher_tool(state["user_query"])
+
+        if result["success"]:
+            return {
+                "enriched_data": result["enriched_data"],
+                "metadata": {
+                    **state.get("metadata", {}),
+                    "enrichment_success": True,
+                    "enrichment_time": time.time()
+                }
+            }
+        else:
+            return {
+                "errors": state.get("errors", []) + [f"Query enrichment failed: {result.get('error', 'Unknown error')}"],
+                "metadata": {
+                    **state.get("metadata", {}),
+                    "enrichment_success": False
+                }
+            }
+
+    except Exception as e:
+        logger.error("Query enrichment node failed", error=str(e), query_id=state["query_id"])
+        return {
+            "errors": state.get("errors", []) + [f"Query enrichment node error: {str(e)}"]
+        }
+
+def generate_kql_node(state: ThreatIntelligenceState) -> Dict[str, Any]:
+    """
+    Node 2: Generate KQL queries using LLM
+    """
+    try:
+        logger.info("Starting KQL generation", query_id=state["query_id"])
+
+        # Call KQL generator tool
+        result = kql_generator_tool(state["enriched_data"])
+
+        if result["success"]:
+            return {
+                "generated_queries": result["generated_queries"],
+                "metadata": {
+                    **state.get("metadata", {}),
+                    "generation_success": True,
+                    "generation_time": time.time(),
+                    "total_tables": result["total_tables"],
+                    "successful_generations": result["successful_generations"]
+                }
+            }
+        else:
+            return {
+                "errors": state.get("errors", []) + [f"KQL generation failed: {result.get('error', 'Unknown error')}"],
+                "metadata": {
+                    **state.get("metadata", {}),
+                    "generation_success": False
+                }
+            }
+
+    except Exception as e:
+        logger.error("KQL generation node failed", error=str(e), query_id=state["query_id"])
+        return {
+            "errors": state.get("errors", []) + [f"KQL generation node error: {str(e)}"]
+        }
+
+def validate_queries_node(state: ThreatIntelligenceState) -> Dict[str, Any]:
+    """
+    Node 3: Validate and repair KQL queries using LLM reflection
+    """
+    try:
+        logger.info("Starting query validation", query_id=state["query_id"])
+
+        # Call query validator tool
+        result = query_validator_tool(state["generated_queries"])
+
+        if result["success"]:
+            return {
+                "validated_queries": result["validated_queries"],
+                "attempts": state.get("attempts", 0) + 1,
+                "metadata": {
+                    **state.get("metadata", {}),
+                    "validation_success": True,
+                    "validation_time": time.time(),
+                    "validation_success_rate": result["success_rate"],
+                    "total_validations": result["total_queries"]
+                }
+            }
+        else:
+            return {
+                "errors": state.get("errors", []) + [f"Query validation failed: {result.get('error', 'Unknown error')}"],
+                "attempts": state.get("attempts", 0) + 1,
+                "metadata": {
+                    **state.get("metadata", {}),
+                    "validation_success": False
+                }
+            }
+
+    except Exception as e:
+        logger.error("Query validation node failed", error=str(e), query_id=state["query_id"])
+        return {
+            "errors": state.get("errors", []) + [f"Query validation node error: {str(e)}"],
+            "attempts": state.get("attempts", 0) + 1
+        }
+
+def finalize_output_node(state: ThreatIntelligenceState) -> Dict[str, Any]:
+    """
+    Node 4: Create final output and summary
+    """
+    try:
+        logger.info("Finalizing output", query_id=state["query_id"])
+
+        # Calculate processing time
+        processing_time = format_processing_time(state["start_time"])
+
+        # Create summary
+        successful_queries = sum(1 for q in state.get("validated_queries", []) if q.get("is_valid", False))
+        total_queries = len(state.get("validated_queries", []))
+
+        summary = {
+            "query_id": state["query_id"],
+            "processing_time_ms": processing_time,
+            "success": len(state.get("errors", [])) == 0,
+            "tables_analyzed": len(state.get("enriched_data", {}).get("selected_tables", [])),
+            "queries_generated": len(state.get("generated_queries", [])),
+            "queries_validated": successful_queries,
+            "total_queries": total_queries,
+            "validation_success_rate": successful_queries / total_queries if total_queries > 0 else 0,
+            "errors": state.get("errors", [])
+        }
+
+        # Create final output
+        final_output = {
+            "success": len(state.get("errors", [])) == 0,
+            "user_query": state["user_query"],
+            "query_id": state["query_id"],
+            "processing_time_ms": processing_time,
+            "enrichment": state.get("enriched_data", {}),
+            "generated_queries": state.get("generated_queries", []),
+            "validated_queries": state.get("validated_queries", []),
+            "executable_queries": [q for q in state.get("validated_queries", []) if q.get("is_valid", False)],
+            "summary": summary,
+            "errors": state.get("errors", []),
+            "metadata": state.get("metadata", {})
+        }
+
+        # Record metrics
+        if final_output["success"]:
+            tables_used = state.get("enriched_data", {}).get("selected_tables", [])
+            metrics_collector.record_query_success(state["query_id"], state["start_time"], tables_used)
+        else:
+            error_type = "validation_failed" if state.get("validated_queries") else "generation_failed"
+            metrics_collector.record_query_failure(state["query_id"], state["start_time"], error_type)
+
+        logger.info("Output finalized", 
+                   query_id=state["query_id"],
+                   success=final_output["success"],
+                   processing_time=processing_time)
+
+        return {"final_output": final_output}
+
+    except Exception as e:
+        logger.error("Output finalization failed", error=str(e), query_id=state["query_id"])
+        error_output = create_error_response(f"Output finalization failed: {str(e)}", state["query_id"])
+        return {"final_output": error_output}
+
+# Conditional edge function for validation loop
+def should_retry_validation(state: ThreatIntelligenceState) -> str:
+    """
+    Determine if validation should be retried based on current state
+    """
+    # Check if there are validation errors and we haven't exceeded max attempts
+    max_attempts = int(os.getenv("MAX_VALIDATION_ATTEMPTS", "3"))
+    current_attempts = state.get("attempts", 0)
+
+    # Get validation results
+    validated_queries = state.get("validated_queries", [])
+    has_invalid_queries = any(not q.get("is_valid", False) for q in validated_queries)
+
+    # Retry if we have invalid queries and haven't exceeded max attempts
+    if has_invalid_queries and current_attempts < max_attempts:
+        logger.info("Retrying validation", 
+                   attempt=current_attempts + 1, 
+                   max_attempts=max_attempts,
+                   query_id=state.get("query_id"))
+        return "generate_kql"  # Go back to generation for another attempt
+
+    logger.info("Proceeding to finalization", 
+               attempt=current_attempts, 
+               query_id=state.get("query_id"))
+    return "finalize_output"
+
+# Build the LangGraph workflow
+def build_workflow() -> StateGraph:
+    """Build the LangGraph workflow"""
+    workflow = StateGraph(ThreatIntelligenceState)
+
+    # Add nodes
+    workflow.add_node("enrich_query", enrich_query_node)
+    workflow.add_node("generate_kql", generate_kql_node)
+    workflow.add_node("validate_queries", validate_queries_node)
+    workflow.add_node("finalize_output", finalize_output_node)
+
+    # Add edges
+    workflow.set_entry_point("enrich_query")
+    workflow.add_edge("enrich_query", "generate_kql")
+    workflow.add_edge("generate_kql", "validate_queries")
+
+    # Add conditional edge for validation loop
+    workflow.add_conditional_edges(
+        "validate_queries",
+        should_retry_validation,
+        {
+            "generate_kql": "generate_kql",
+            "finalize_output": "finalize_output"
+        }
+    )
+
+    workflow.add_edge("finalize_output", END)
+
+    return workflow
+
+# Compile the graph
+graph = build_workflow().compile()
+
+class ThreatIntelligenceAgent:
+    """Main agent class for threat intelligence analysis"""
 
     def __init__(self):
-        self.workflow = self._build_workflow()
+        self.security_validator = SecurityValidator()
+        self.workflow = graph
 
-    def _build_workflow(self) -> StateGraph:
-        """Build the LangGraph workflow"""
-
-        # Create the state graph
-        workflow = StateGraph(ThreatIntelState)
-
-        # Add nodes
-        workflow.add_node("enrich_query", self._enrich_query_node)
-        workflow.add_node("generate_kql", self._generate_kql_node)
-        workflow.add_node("validate_queries", self._validate_queries_node)
-        workflow.add_node("create_analysis", self._create_analysis_node)
-
-        # Define the workflow edges
-        workflow.add_edge(START, "enrich_query")
-        workflow.add_edge("enrich_query", "generate_kql")
-        workflow.add_edge("generate_kql", "validate_queries")
-        workflow.add_edge("validate_queries", "create_analysis")
-        workflow.add_edge("create_analysis", END)
-
-        return workflow.compile()
-
-    def _enrich_query_node(self, state: ThreatIntelState) -> ThreatIntelState:
-        """Node to enrich the user query"""
-
-        user_query = state.get("user_query", "")
-        if not user_query and state.get("messages"):
-            # Extract query from messages if not provided directly
-            last_message = state["messages"][-1]
-            if isinstance(last_message, HumanMessage):
-                user_query = last_message.content
-
-        # Use our custom tool to enrich the query
-        enriched_data = enrich_user_query.invoke({"user_query": user_query})
-
-        # Add system message about enrichment
-        enrichment_msg = AIMessage(
-            content=f"Query enriched. Selected tables: {enriched_data['selected_tables']}. "
-                   f"IOC types identified: {enriched_data['ioc_types']}"
-        )
-
-        return {
-            **state,
-            "user_query": user_query,
-            "enriched_data": enriched_data,
-            "current_step": "enrichment_complete",
-            "messages": state.get("messages", []) + [enrichment_msg]
-        }
-
-    def _generate_kql_node(self, state: ThreatIntelState) -> ThreatIntelState:
-        """Node to generate KQL queries"""
-
-        enriched_data = state.get("enriched_data", {})
-
-        # Generate KQL queries using our custom tool
-        generated_queries = generate_kql_queries.invoke({"enriched_data": enriched_data})
-
-        # Create message about generation
-        generation_msg = AIMessage(
-            content=f"Generated {generated_queries['total_tables']} KQL queries for threat hunting analysis."
-        )
-
-        return {
-            **state,
-            "generated_queries": generated_queries,
-            "current_step": "kql_generation_complete",
-            "messages": state.get("messages", []) + [generation_msg]
-        }
-
-    def _validate_queries_node(self, state: ThreatIntelState) -> ThreatIntelState:
-        """Node to validate the generated queries"""
-
-        generated_queries = state.get("generated_queries", {})
-
-        # Validate queries using our custom tool
-        validated_queries = validate_and_refine_queries.invoke({"query_data": generated_queries})
-
-        # Create validation message
-        summary = validated_queries["validation_summary"]
-        validation_msg = AIMessage(
-            content=f"Validation complete. Success rate: {summary['success_rate']}. "
-                   f"Average validation score: {summary['avg_validation_score']}"
-        )
-
-        return {
-            **state,
-            "validated_queries": validated_queries,
-            "current_step": "validation_complete", 
-            "messages": state.get("messages", []) + [validation_msg]
-        }
-
-    def _create_analysis_node(self, state: ThreatIntelState) -> ThreatIntelState:
-        """Node to create final threat intelligence analysis"""
-
-        user_query = state.get("user_query", "")
-        enriched_data = state.get("enriched_data", {})
-        validated_queries = state.get("validated_queries", {})
-
-        # Create comprehensive analysis
-        final_analysis = self._generate_final_analysis(user_query, enriched_data, validated_queries)
-
-        # Create final analysis message
-        analysis_msg = AIMessage(
-            content=f"Threat intelligence analysis complete. "
-                   f"Ready to execute {len(final_analysis['executable_queries'])} validated queries."
-        )
-
-        return {
-            **state,
-            "final_analysis": final_analysis,
-            "current_step": "analysis_complete",
-            "messages": state.get("messages", []) + [analysis_msg]
-        }
-
-    def _generate_final_analysis(self, user_query: str, enriched_data: Dict, 
-                                validated_queries: Dict) -> Dict[str, Any]:
-        """Generate comprehensive threat intelligence analysis"""
-
-        executable_queries = [
-            q for q in validated_queries.get("validated_queries", [])
-            if q.get("validation_passed", False)
-        ]
-
-        analysis = {
-            "summary": {
-                "original_request": user_query,
-                "analysis_scope": enriched_data.get("ioc_types", []),
-                "tables_analyzed": enriched_data.get("selected_tables", []),
-                "time_range": enriched_data.get("time_range", "7d"),
-                "total_queries": len(validated_queries.get("validated_queries", [])),
-                "executable_queries": len(executable_queries)
-            },
-            "executable_queries": executable_queries,
-            "recommendations": self._generate_recommendations(enriched_data, validated_queries),
-            "next_steps": [
-                "Execute the validated KQL queries in Azure Sentinel",
-                "Review results for potential threats and anomalies", 
-                "Correlate findings across multiple data sources",
-                "Create alerts or investigate further based on findings"
-            ]
-        }
-
-        return analysis
-
-    def _generate_recommendations(self, enriched_data: Dict, validated_queries: Dict) -> List[str]:
-        """Generate actionable recommendations"""
-
-        recommendations = []
-
-        # General recommendations
-        recommendations.append("Execute queries during low-traffic hours for better performance")
-
-        # IOC-specific recommendations
-        ioc_types = enriched_data.get("ioc_types", [])
-        if "ip_address" in ioc_types:
-            recommendations.append("Consider geo-location analysis for suspicious IP addresses")
-        if "email" in ioc_types:
-            recommendations.append("Review email attachment analysis and domain reputation")
-        if "file_hash" in ioc_types:
-            recommendations.append("Cross-reference file hashes with threat intelligence feeds")
-
-        # Validation-based recommendations
-        validation_summary = validated_queries.get("validation_summary", {})
-        if validation_summary.get("success_rate", 0) < 1.0:
-            recommendations.append("Review failed validations and refine queries as needed")
-
-        return recommendations
-
-    def process_threat_query(self, user_query: str) -> Dict[str, Any]:
+    def process_query(self, user_query: str) -> Dict[str, Any]:
         """
         Process a threat intelligence query through the complete workflow
 
         Args:
-            user_query: Natural language threat hunting request
+            user_query: Natural language threat hunting query
 
         Returns:
-            Complete analysis with validated KQL queries and recommendations
+            Complete threat intelligence analysis result
         """
+        # Generate query ID and start time
+        query_id = generate_query_id()
+        start_time = time.time()
 
-        # Initialize state
-        initial_state = ThreatIntelState(
-            messages=[HumanMessage(content=user_query)],
-            user_query=user_query,
-            enriched_data={},
-            generated_queries={},
-            validated_queries={},
-            final_analysis={},
-            current_step="initialized"
-        )
-
-        # Run the workflow
         try:
+            # Sanitize input
+            sanitized_query = self.security_validator.sanitize_input(user_query)
+            if not sanitized_query:
+                return create_error_response("Invalid or empty query", query_id)
+
+            # Record query start
+            metrics_collector.record_query_start(query_id)
+
+            # Initialize state
+            initial_state = ThreatIntelligenceState(
+                user_query=sanitized_query,
+                enriched_data={},
+                generated_queries=[],
+                validated_queries=[],
+                final_output={},
+                errors=[],
+                attempts=0,
+                query_id=query_id,
+                start_time=start_time,
+                metadata={"start_time": start_time}
+            )
+
+            # Execute workflow
             result = self.workflow.invoke(initial_state)
-            return {
-                "success": True,
-                "analysis": result.get("final_analysis", {}),
-                "workflow_messages": [msg.content for msg in result.get("messages", [])],
-                "metadata": {
-                    "enriched_data": result.get("enriched_data", {}),
-                    "validation_summary": result.get("validated_queries", {}).get("validation_summary", {})
-                }
-            }
+
+            return result["final_output"]
+
         except Exception as e:
-            return {
-                "success": False,
-                "error": str(e),
-                "analysis": {}
-            }
+            logger.error("Workflow execution failed", error=str(e), query_id=query_id)
+            metrics_collector.record_query_failure(query_id, start_time, "workflow_error")
+            return create_error_response(f"Workflow execution failed: {str(e)}", query_id)
 
+    def get_metrics(self) -> Dict[str, Any]:
+        """Get current system metrics"""
+        return metrics_collector.get_metrics_summary()
+
+# Example usage and testing
 def main():
-    """Main function to demonstrate the threat intelligence system"""
+    """Main function for testing the system"""
+    print("🚀 Starting Threat Intelligence System Test")
 
-    print("=== Simple Threat Intelligence System ===\n")
+    # Initialize agent
+    agent = ThreatIntelligenceAgent()
 
-    # Initialize the agent
-    agent = SimpleThreatIntelAgent()
-
-    # Example queries to test
-    example_queries = [
-        "Find suspicious email activities from external domains in the last week",
-        "Detect multiple failed login attempts from unknown IP addresses", 
-        "Identify potential malware file executions on critical servers",
-        "Look for unusual DNS queries to suspicious domains"
+    # Test queries
+    test_queries = [
+        "Find suspicious email activities from external domains",
+        "Look for failed login attempts from unusual IP addresses",
+        "Detect potential malware execution on endpoints",
+        "Investigate DNS tunneling activities"
     ]
 
-    print("Testing with example queries:\n")
+    for i, query in enumerate(test_queries, 1):
+        print(f"\n{'='*50}")
+        print(f"Test {i}/{len(test_queries)}: {query}")
+        print(f"{'='*50}")
 
-    for i, query in enumerate(example_queries, 1):
-        print(f"Query {i}: {query}")
-        print("-" * 80)
+        result = agent.process_query(query)
 
-        # Process the query
-        result = agent.process_threat_query(query)
+        print(f"✅ Success: {result['success']}")
+        print(f"⏱️  Processing time: {result.get('processing_time_ms', 0):.2f}ms")
 
-        if result["success"]:
-            analysis = result["analysis"]
-            print(f"✓ Analysis successful")
-            print(f"  Tables analyzed: {analysis['summary']['tables_analyzed']}")
-            print(f"  Executable queries: {analysis['summary']['executable_queries']}")
-            print(f"  Key recommendations: {len(analysis['recommendations'])}")
+        if result['success']:
+            summary = result['summary']
+            print(f"📊 Tables analyzed: {summary['tables_analyzed']}")
+            print(f"🔍 Queries generated: {summary['queries_generated']}")
+            print(f"✅ Queries validated: {summary['queries_validated']}")
+            print(f"📈 Success rate: {summary['validation_success_rate']:.2%}")
 
-            # Show first executable query as example
-            if analysis["executable_queries"]:
-                first_query = analysis["executable_queries"][0]
-                print(f"  Sample KQL query for {first_query['table']}:")
-                print(f"    {first_query['refined_query'][:100]}...")
+            print("\n🔍 Executable Queries:")
+            for query_data in result.get('executable_queries', []):
+                print(f"  Table: {query_data.get('table', 'Unknown')}")
+                print(f"  Query: {query_data.get('final_query', 'No query')[:100]}...")
+                print(f"  Confidence: {query_data.get('confidence_final', 0):.2f}")
+                print()
         else:
-            print(f"✗ Analysis failed: {result['error']}")
+            print(f"❌ Errors: {result.get('errors', [])}")
 
-        print("\n")
+    # Print final metrics
+    print(f"\n{'='*50}")
+    print("📊 Final System Metrics")
+    print(f"{'='*50}")
+    metrics = agent.get_metrics()
+    print(f"Success rate: {metrics['success_rate']:.2%}")
+    print(f"Average processing time: {metrics['avg_processing_time_seconds']:.2f}s")
+    print(f"Total queries processed: {metrics['total_queries']}")
+    print(f"Total LLM calls: {metrics['llm_calls']}")
 
 if __name__ == "__main__":
     main()

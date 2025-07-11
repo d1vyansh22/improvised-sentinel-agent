@@ -60,10 +60,10 @@ python main.py
 ### 3. Use Programmatically
 
 ```python
-from main import SimpleThreatIntelAgent
+from main import ThreatIntelligenceAgent
 
 # Initialize the agent
-agent = SimpleThreatIntelAgent()
+agent = ThreatIntelligenceAgent()
 
 # Process a threat hunting query
 result = agent.process_threat_query(
@@ -193,63 +193,4 @@ This tests:
 
 The system is designed to work standalone, but you can enhance it with LLMs:
 
-```python
-# Add to .env file
-OPENAI_API_KEY=your_key_here
-# or
-GOOGLE_API_KEY=your_key_here
-
-# The tools can then be enhanced with LLM reasoning
 ```
-
-### Custom Workflow Modifications
-
-Modify the LangGraph workflow in `main.py`:
-
-```python
-def _build_workflow(self):
-    workflow = StateGraph(ThreatIntelState)
-
-    # Add custom nodes
-    workflow.add_node("custom_analysis", self._custom_node)
-
-    # Modify edges
-    workflow.add_edge("validate_queries", "custom_analysis")
-    workflow.add_edge("custom_analysis", "create_analysis")
-
-    return workflow.compile()
-```
-
-## 📚 Learning Resources
-
-- **LangChain Documentation**: [python.langchain.com](https://python.langchain.com)
-- **LangGraph Guide**: [langchain-ai.github.io/langgraph](https://langchain-ai.github.io/langgraph)
-- **KQL Reference**: [Microsoft KQL Documentation](https://docs.microsoft.com/en-us/azure/kusto/query/)
-- **Azure Sentinel**: [Microsoft Sentinel Documentation](https://docs.microsoft.com/en-us/azure/sentinel/)
-
-## 🤝 Contributing
-
-This is designed as a learning project and foundation for more complex systems. Feel free to:
-
-- Add new IOC detection patterns
-- Enhance KQL generation logic
-- Improve validation rules
-- Add more Azure Sentinel tables
-- Create additional tools
-
-## 📝 License
-
-This project is for educational purposes. Use responsibly and in accordance with your organization's security policies.
-
-## 🔗 Related Projects
-
-- **LangChain**: Framework for LLM applications
-- **LangGraph**: Stateful multi-actor applications  
-- **Azure Sentinel**: Cloud-native SIEM platform
-- **KQL**: Kusto Query Language for data analysis
-
----
-
-**Built with ❤️ using LangChain and LangGraph**
-
-*This system demonstrates how to build sophisticated AI applications with minimal code using out-of-the-box framework functionality.*
